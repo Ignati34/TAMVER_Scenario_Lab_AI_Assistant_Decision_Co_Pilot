@@ -1,0 +1,22 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: tamver_scenario_api
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: tamver_scenario_ui
+    environment:
+      API_URL: http://api:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+    restart: unless-stopped
