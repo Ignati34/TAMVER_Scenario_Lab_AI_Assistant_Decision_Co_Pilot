@@ -1,0 +1,120 @@
+{
+  "nodes": [
+    {
+      "id": "energy_cost",
+      "label": "Energy Cost",
+      "kind": "system",
+      "baseline": 0.1,
+      "target": 0.1,
+      "risk_weight": 1.2,
+      "direction": "minimize",
+      "uncertainty": 0.05,
+      "decision_min": -0.3,
+      "decision_max": 0.3,
+      "decision_cost": 1.0
+    },
+    {
+      "id": "logistics",
+      "label": "Logistics Reliability",
+      "kind": "system",
+      "baseline": 0.75,
+      "target": 0.85,
+      "risk_weight": 1.1,
+      "direction": "maximize",
+      "uncertainty": 0.04,
+      "decision_min": -0.3,
+      "decision_max": 0.3,
+      "decision_cost": 1.0
+    },
+    {
+      "id": "operating_cost",
+      "label": "Operating Cost",
+      "kind": "system",
+      "baseline": 0.3,
+      "target": 0.25,
+      "risk_weight": 1.3,
+      "direction": "minimize",
+      "uncertainty": 0.05,
+      "decision_min": -0.3,
+      "decision_max": 0.3,
+      "decision_cost": 1.0
+    },
+    {
+      "id": "margin",
+      "label": "Operating Margin",
+      "kind": "system",
+      "baseline": 0.18,
+      "target": 0.24,
+      "risk_weight": 1.5,
+      "direction": "maximize",
+      "uncertainty": 0.03,
+      "decision_min": -0.3,
+      "decision_max": 0.3,
+      "decision_cost": 1.0
+    },
+    {
+      "id": "liquidity",
+      "label": "Liquidity",
+      "kind": "system",
+      "baseline": 0.55,
+      "target": 0.7,
+      "risk_weight": 1.5,
+      "direction": "maximize",
+      "uncertainty": 0.04,
+      "decision_min": -0.3,
+      "decision_max": 0.3,
+      "decision_cost": 1.0
+    },
+    {
+      "id": "supplier_diversification",
+      "label": "Supplier Diversification",
+      "kind": "decision",
+      "baseline": 0.0,
+      "target": 0.0,
+      "risk_weight": 0.0,
+      "direction": "target",
+      "uncertainty": 0.01,
+      "decision_min": 0.0,
+      "decision_max": 0.3,
+      "decision_cost": 1.2
+    },
+    {
+      "id": "hedging",
+      "label": "Energy Hedging",
+      "kind": "decision",
+      "baseline": 0.0,
+      "target": 0.0,
+      "risk_weight": 0.0,
+      "direction": "target",
+      "uncertainty": 0.01,
+      "decision_min": 0.0,
+      "decision_max": 0.25,
+      "decision_cost": 1.0
+    },
+    {
+      "id": "working_capital",
+      "label": "Working Capital Program",
+      "kind": "decision",
+      "baseline": 0.0,
+      "target": 0.0,
+      "risk_weight": 0.0,
+      "direction": "target",
+      "uncertainty": 0.01,
+      "decision_min": 0.0,
+      "decision_max": 0.3,
+      "decision_cost": 0.9
+    }
+  ],
+  "edges": [
+    {"source": "energy_cost", "target": "operating_cost", "weight": 0.7, "confidence": 0.9},
+    {"source": "operating_cost", "target": "margin", "weight": -0.65, "confidence": 0.95},
+    {"source": "margin", "target": "liquidity", "weight": 0.55, "confidence": 0.9},
+    {"source": "logistics", "target": "operating_cost", "weight": -0.3, "confidence": 0.8},
+    {"source": "logistics", "target": "margin", "weight": 0.35, "confidence": 0.8},
+    {"source": "supplier_diversification", "target": "logistics", "weight": 0.75, "confidence": 0.85},
+    {"source": "supplier_diversification", "target": "operating_cost", "weight": -0.2, "confidence": 0.75},
+    {"source": "hedging", "target": "energy_cost", "weight": -0.8, "confidence": 0.9},
+    {"source": "working_capital", "target": "liquidity", "weight": 0.85, "confidence": 0.9},
+    {"source": "working_capital", "target": "margin", "weight": -0.1, "confidence": 0.7}
+  ]
+}
