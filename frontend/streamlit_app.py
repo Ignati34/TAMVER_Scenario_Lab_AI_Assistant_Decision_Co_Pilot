@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 
 import altair as alt
-import networkx as nx
 import pandas as pd
 import requests
 import streamlit as st
@@ -27,11 +26,11 @@ st.caption("Scenario Lab · AIR propagation · Monte Carlo · Decision Agent")
 
 
 @st.cache_data
-def load_default_graph():
+def load_default_graph() -> dict:
     return json.loads(DEFAULT_GRAPH.read_text(encoding="utf-8"))
 
 
-def api_post(path: str, payload: dict):
+def api_post(path: str, payload: dict) -> dict:
     response = requests.post(
         f"{API_URL}{path}",
         json=payload,
@@ -41,7 +40,7 @@ def api_post(path: str, payload: dict):
     return response.json()
 
 
-def render_graph(graph: dict, impact_map: dict | None = None):
+def render_graph(graph: dict, impact_map: dict | None = None) -> None:
     network = Network(
         height="620px",
         width="100%",
@@ -76,18 +75,16 @@ def render_graph(graph: dict, impact_map: dict | None = None):
             edge["source"],
             edge["target"],
             value=abs(edge["weight"]) * 5,
-            title=f"weight={edge['weight']}; confidence={edge.get('confidence', 1)}",
+            title=(
+                f"weight={edge['weight']}; "
+                f"confidence={edge.get('confidence', 1)}"
+            ),
             color="#FF8A80" if edge["weight"] < 0 else "#90CAF9",
             arrows="to",
         )
 
-    html_path = Path("/tmp/tamver_graph.html")
-    network.write_html(str(html_path), notebook=False)
-    components.html(
-        html_path.read_text(encoding="utf-8"),
-        height=640,
-        scrolling=True,
-    )
+    html = network.generate_html(notebook=False)
+    components.html(html, height=640, scrolling=True)
 
 
 def decision_actions_summary(
@@ -126,7 +123,7 @@ def corridor_dataframe(
     recommendation_data: dict,
     graph: dict,
 ) -> pd.DataFrame:
-    rows = []
+    rows: list[dict] = []
 
     baseline = recommendation_data.get("baseline", {})
     if baseline:
@@ -136,8 +133,12 @@ def corridor_dataframe(
                 "variant": "Baseline",
                 "variant_type": "Baseline",
                 "cost": 0.0,
-                "risk_p05": float(baseline.get("risk_p05", baseline_risk)),
-                "risk_mean": float(baseline.get("risk_mean", baseline_risk)),
+                "risk_p05": float(
+                    baseline.get("risk_p05", baseline_risk)
+                ),
+                "risk_mean": float(
+                    baseline.get("risk_mean", baseline_risk)
+                ),
                 "risk_p95": float(
                     baseline.get("robust_risk_p95", baseline_risk)
                 ),
@@ -166,7 +167,10 @@ def corridor_dataframe(
                     evaluation.get("risk_mean", deterministic_risk)
                 ),
                 "risk_p95": float(
-                    evaluation.get("robust_risk_p95", deterministic_risk)
+                    evaluation.get(
+                        "robust_risk_p95",
+                        deterministic_risk,
+                    )
                 ),
                 "stability": float(evaluation.get("stability", 0.0)),
                 "score": float(evaluation.get("score", 0.0)),
@@ -191,6 +195,55 @@ def corridor_dataframe(
     )
 
 
+def quality_score(
+    series: pd.Series,
+    *,
+    higher_is_better: bool,
+) -> pd.Series:
+    minimum = float(series.min())
+    maximum = float(series.max())
+    spread = maximum - minimum
+
+    if spread <= 1e-12:
+        return pd.Series(1.0, index=series.index)
+
+    normalized = (series - minimum) / spread
+    return normalized if higher_is_better else 1.0 - normalized
+
+
+def append_special_role(
+    frame: pd.DataFrame,
+    variant: str,
+    role: str,
+) -> None:
+    mask = frame["variant"] == variant
+    current = frame.loc[mask, "special_role"].astype(str)
+    frame.loc[mask, "special_role"] = current.apply(
+        lambda value: role if not value else f"{value} · {role}"
+    )
+
+
+def render_solution_card(
+    title: str,
+    row: pd.Series | None,
+    *,
+    note: str,
+) -> None:
+    with st.container(border=True):
+        st.markdown(f"**{title}**")
+        if row is None:
+            st.caption("Нет варианта, соответствующего ограничениям.")
+            return
+
+        st.metric("Стресс-риск P95", f"{row['risk_p95']:.4f}")
+        st.caption(
+            f"{row['variant']} · стоимость {row['cost']:.3f} · "
+            f"устойчивость {row['stability']:.1f}/100"
+        )
+        st.caption(note)
+        st.caption(f"Действия: {row['actions']}")
+
+
 def render_decision_corridor(
     recommendation_data: dict,
     graph: dict,
@@ -203,64 +256,109 @@ def render_decision_corridor(
         )
         return
 
-    baseline_row = corridor_df[
+    baseline_rows = corridor_df[
         corridor_df["variant_type"] == "Baseline"
     ]
-    if baseline_row.empty:
+    if baseline_rows.empty:
         baseline_p95 = float(corridor_df["risk_p95"].max())
+        baseline_stability = float(corridor_df["stability"].max())
+        baseline = None
     else:
-        baseline_p95 = float(baseline_row.iloc[0]["risk_p95"])
+        baseline = baseline_rows.iloc[0]
+        baseline_p95 = float(baseline["risk_p95"])
+        baseline_stability = float(baseline["stability"])
 
     max_observed_cost = max(float(corridor_df["cost"].max()), 0.01)
-    min_observed_stability = float(corridor_df["stability"].min())
 
     st.subheader("Decision Opportunity Corridor")
     st.caption(
-        "Коридор показывает множество допустимых решений: "
         "P05 — благоприятная граница, среднее — ожидаемый риск, "
-        "P95 — стресс-граница."
+        "P95 — стресс-граница. Контрольные точки показывают baseline, "
+        "минимальный риск, сбалансированный оптимум и минимальную "
+        "стоимость допустимого решения."
     )
 
     controls, visual = st.columns([1, 3])
 
     with controls:
         st.markdown("#### Параметры коридора")
+
+        default_risk_threshold = max(baseline_p95 * 0.70, 0.0)
+        default_max_cost = max(max_observed_cost * 0.75, 0.01)
+        default_min_stability = max(
+            0.0,
+            min(100.0, baseline_stability * 0.85),
+        )
+
         risk_threshold = st.number_input(
             "Максимальный стресс-риск P95",
             min_value=0.0,
-            value=max(baseline_p95, 0.0),
-            step=0.01,
+            value=float(default_risk_threshold),
+            step=max(default_risk_threshold / 20, 0.005),
             format="%.4f",
-            key="corridor_risk_threshold",
+            key="corridor_risk_threshold_v2",
         )
         max_cost = st.number_input(
             "Максимальная стоимость",
             min_value=0.0,
-            value=max_observed_cost,
-            step=max(max_observed_cost / 20, 0.01),
+            value=float(default_max_cost),
+            step=max(default_max_cost / 20, 0.01),
             format="%.3f",
-            key="corridor_max_cost",
+            key="corridor_max_cost_v2",
         )
         min_stability = st.slider(
             "Минимальная устойчивость",
             min_value=0.0,
             max_value=100.0,
-            value=max(0.0, min(100.0, min_observed_stability)),
+            value=float(default_min_stability),
             step=1.0,
-            key="corridor_min_stability",
+            key="corridor_min_stability_v2",
         )
+
+        with st.expander("Весовые коэффициенты Balanced Optimum"):
+            risk_weight = st.slider(
+                "Риск",
+                0,
+                100,
+                50,
+                5,
+                key="balanced_risk_weight",
+            )
+            cost_weight = st.slider(
+                "Стоимость",
+                0,
+                100,
+                30,
+                5,
+                key="balanced_cost_weight",
+            )
+            stability_weight = st.slider(
+                "Устойчивость",
+                0,
+                100,
+                20,
+                5,
+                key="balanced_stability_weight",
+            )
+            st.caption(
+                "Balanced Score нормирует показатели внутри допустимой "
+                "зоны и объединяет их с заданными весами."
+            )
+
         show_only_safe = st.checkbox(
             "Показывать только допустимые",
             value=False,
-            key="corridor_show_only_safe",
+            key="corridor_show_only_safe_v2",
         )
 
     working_df = corridor_df.copy()
     working_df["zone"] = "Вне ограничений"
+
     safe_mask = (
         (working_df["risk_p95"] <= risk_threshold)
         & (working_df["cost"] <= max_cost)
         & (working_df["stability"] >= min_stability)
+        & (working_df["variant_type"] == "Решение")
     )
     working_df.loc[safe_mask, "zone"] = "Допустимое решение"
     working_df.loc[
@@ -268,71 +366,198 @@ def render_decision_corridor(
         "zone",
     ] = "Baseline"
 
-    display_df = working_df
-    if show_only_safe:
-        display_df = working_df[
-            working_df["zone"].isin(["Допустимое решение", "Baseline"])
-        ].copy()
+    working_df["risk_reduction"] = baseline_p95 - working_df["risk_p95"]
+    working_df["risk_reduction_pct"] = (
+        working_df["risk_reduction"] / max(baseline_p95, 1e-12) * 100.0
+    )
+    working_df["efficiency"] = 0.0
+    positive_cost = working_df["cost"] > 1e-12
+    working_df.loc[positive_cost, "efficiency"] = (
+        working_df.loc[positive_cost, "risk_reduction"]
+        / working_df.loc[positive_cost, "cost"]
+    )
 
+    all_solutions = working_df[
+        working_df["variant_type"] == "Решение"
+    ].copy()
     safe_solutions = working_df[
         working_df["zone"] == "Допустимое решение"
     ].copy()
-    if safe_solutions.empty:
-        best_solution = working_df[
-            working_df["variant_type"] == "Решение"
-        ].sort_values(
-            ["risk_p95", "cost", "stability"],
-            ascending=[True, True, False],
-        ).head(1)
-    else:
-        best_solution = safe_solutions.sort_values(
-            ["risk_p95", "cost", "stability"],
-            ascending=[True, True, False],
-        ).head(1)
+    selection_pool = (
+        safe_solutions.copy()
+        if not safe_solutions.empty
+        else all_solutions.copy()
+    )
 
-    if not best_solution.empty:
-        best_variant = best_solution.iloc[0]["variant"]
-        working_df["is_best"] = working_df["variant"] == best_variant
-        display_df["is_best"] = display_df["variant"] == best_variant
+    total_weight = risk_weight + cost_weight + stability_weight
+    if total_weight <= 0:
+        risk_weight, cost_weight, stability_weight = 50, 30, 20
+        total_weight = 100
+
+    if not selection_pool.empty:
+        risk_quality = quality_score(
+            selection_pool["risk_p95"],
+            higher_is_better=False,
+        )
+        cost_quality = quality_score(
+            selection_pool["cost"],
+            higher_is_better=False,
+        )
+        stability_quality = quality_score(
+            selection_pool["stability"],
+            higher_is_better=True,
+        )
+        selection_pool["balanced_score"] = 100.0 * (
+            (risk_weight / total_weight) * risk_quality
+            + (cost_weight / total_weight) * cost_quality
+            + (stability_weight / total_weight) * stability_quality
+        )
     else:
-        working_df["is_best"] = False
-        display_df["is_best"] = False
+        selection_pool["balanced_score"] = pd.Series(dtype=float)
+
+    working_df["balanced_score"] = float("nan")
+    if not selection_pool.empty:
+        score_map = selection_pool.set_index("variant")["balanced_score"]
+        working_df["balanced_score"] = working_df["variant"].map(score_map)
+
+    minimum_risk = (
+        all_solutions.sort_values(
+            ["risk_p95", "cost", "stability"],
+            ascending=[True, True, False],
+        ).head(1)
+        if not all_solutions.empty
+        else pd.DataFrame()
+    )
+    minimum_cost = (
+        safe_solutions.sort_values(
+            ["cost", "risk_p95", "stability"],
+            ascending=[True, True, False],
+        ).head(1)
+        if not safe_solutions.empty
+        else pd.DataFrame()
+    )
+    balanced_optimum = (
+        selection_pool.sort_values(
+            ["balanced_score", "risk_p95", "cost"],
+            ascending=[False, True, True],
+        ).head(1)
+        if not selection_pool.empty
+        else pd.DataFrame()
+    )
+    efficiency_champion = (
+        selection_pool.sort_values(
+            ["efficiency", "risk_p95", "cost"],
+            ascending=[False, True, True],
+        ).head(1)
+        if not selection_pool.empty
+        else pd.DataFrame()
+    )
+
+    working_df["special_role"] = ""
+    if baseline is not None:
+        append_special_role(working_df, "Baseline", "Baseline")
+    if not minimum_risk.empty:
+        append_special_role(
+            working_df,
+            str(minimum_risk.iloc[0]["variant"]),
+            "Minimum Risk",
+        )
+    if not balanced_optimum.empty:
+        append_special_role(
+            working_df,
+            str(balanced_optimum.iloc[0]["variant"]),
+            "Balanced Optimum",
+        )
+    if not minimum_cost.empty:
+        append_special_role(
+            working_df,
+            str(minimum_cost.iloc[0]["variant"]),
+            "Minimum Cost",
+        )
+
+    display_df = working_df.copy()
+    if show_only_safe:
+        display_df = working_df[
+            working_df["zone"].isin(
+                ["Допустимое решение", "Baseline"]
+            )
+        ].copy()
+
+    baseline_row = baseline if baseline is not None else None
+    min_risk_row = (
+        minimum_risk.iloc[0] if not minimum_risk.empty else None
+    )
+    balanced_row = (
+        balanced_optimum.iloc[0]
+        if not balanced_optimum.empty
+        else None
+    )
+    min_cost_row = (
+        minimum_cost.iloc[0] if not minimum_cost.empty else None
+    )
+    efficiency_row = (
+        efficiency_champion.iloc[0]
+        if not efficiency_champion.empty
+        else None
+    )
 
     with visual:
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Вариантов", int((working_df["variant_type"] == "Решение").sum()))
-        m2.metric("Допустимых", int(len(safe_solutions)))
-        m3.metric(
-            "Лучший P95",
-            (
-                f"{best_solution.iloc[0]['risk_p95']:.4f}"
-                if not best_solution.empty
-                else "—"
-            ),
+        m1.metric(
+            "Вариантов",
+            int((working_df["variant_type"] == "Решение").sum()),
         )
+        m2.metric("Допустимых", int(len(safe_solutions)))
+        m3.metric("Baseline P95", f"{baseline_p95:.4f}")
         m4.metric(
-            "Стоимость лучшего",
-            (
-                f"{best_solution.iloc[0]['cost']:.3f}"
-                if not best_solution.empty
-                else "—"
-            ),
+            "Balanced P95",
+            f"{balanced_row['risk_p95']:.4f}"
+            if balanced_row is not None
+            else "—",
         )
 
         tooltip = [
             alt.Tooltip("variant:N", title="Вариант"),
+            alt.Tooltip("special_role:N", title="Контрольная точка"),
             alt.Tooltip("zone:N", title="Статус"),
             alt.Tooltip("cost:Q", title="Стоимость", format=".3f"),
             alt.Tooltip("risk_p05:Q", title="Риск P05", format=".4f"),
-            alt.Tooltip("risk_mean:Q", title="Средний риск", format=".4f"),
-            alt.Tooltip("risk_p95:Q", title="Стресс-риск P95", format=".4f"),
-            alt.Tooltip("stability:Q", title="Устойчивость", format=".1f"),
+            alt.Tooltip(
+                "risk_mean:Q",
+                title="Средний риск",
+                format=".4f",
+            ),
+            alt.Tooltip(
+                "risk_p95:Q",
+                title="Стресс-риск P95",
+                format=".4f",
+            ),
+            alt.Tooltip(
+                "risk_reduction_pct:Q",
+                title="Снижение P95",
+                format=".1f",
+            ),
+            alt.Tooltip(
+                "efficiency:Q",
+                title="Эффективность",
+                format=".4f",
+            ),
+            alt.Tooltip(
+                "stability:Q",
+                title="Устойчивость",
+                format=".1f",
+            ),
+            alt.Tooltip(
+                "balanced_score:Q",
+                title="Balanced Score",
+                format=".1f",
+            ),
             alt.Tooltip("actions:N", title="Действия"),
         ]
 
         band = (
             alt.Chart(display_df)
-            .mark_area(opacity=0.18)
+            .mark_area(opacity=0.16)
             .encode(
                 x=alt.X(
                     "cost:Q",
@@ -350,23 +575,13 @@ def render_decision_corridor(
             )
         )
 
-        mean_line = (
+        interval_rules = (
             alt.Chart(display_df)
-            .mark_line(point=False, strokeWidth=3)
+            .mark_rule(strokeWidth=2)
             .encode(
                 x="cost:Q",
-                y="risk_mean:Q",
-                order=alt.Order("cost:Q"),
-                tooltip=tooltip,
-            )
-        )
-
-        points = (
-            alt.Chart(display_df)
-            .mark_circle(size=110, opacity=0.95)
-            .encode(
-                x="cost:Q",
-                y="risk_mean:Q",
+                y="risk_p05:Q",
+                y2="risk_p95:Q",
                 color=alt.Color(
                     "zone:N",
                     title="Зона решения",
@@ -383,13 +598,23 @@ def render_decision_corridor(
             )
         )
 
-        interval_rules = (
+        mean_line = (
             alt.Chart(display_df)
-            .mark_rule(strokeWidth=2)
+            .mark_line(point=False, strokeWidth=3)
             .encode(
                 x="cost:Q",
-                y="risk_p05:Q",
-                y2="risk_p95:Q",
+                y="risk_mean:Q",
+                order=alt.Order("cost:Q"),
+                tooltip=tooltip,
+            )
+        )
+
+        points = (
+            alt.Chart(display_df)
+            .mark_circle(size=100, opacity=0.92)
+            .encode(
+                x="cost:Q",
+                y="risk_mean:Q",
                 color=alt.Color(
                     "zone:N",
                     legend=None,
@@ -406,27 +631,51 @@ def render_decision_corridor(
             )
         )
 
-        threshold_data = pd.DataFrame(
-            {"risk_threshold": [float(risk_threshold)]}
-        )
         threshold_rule = (
-            alt.Chart(threshold_data)
-            .mark_rule(color="#D32F2F", strokeDash=[8, 5], strokeWidth=2)
+            alt.Chart(
+                pd.DataFrame(
+                    {"risk_threshold": [float(risk_threshold)]}
+                )
+            )
+            .mark_rule(
+                color="#D32F2F",
+                strokeDash=[8, 5],
+                strokeWidth=2,
+            )
             .encode(y="risk_threshold:Q")
         )
 
-        best_marker = (
-            alt.Chart(display_df[display_df["is_best"]])
-            .mark_point(
-                shape="diamond",
-                size=260,
-                filled=True,
-                color="#1565C0",
+        special_df = display_df[
+            display_df["special_role"] != ""
+        ].copy()
+        special_markers = (
+            alt.Chart(special_df)
+            .mark_point(size=300, filled=True)
+            .encode(
+                x="cost:Q",
+                y="risk_mean:Q",
+                shape=alt.Shape(
+                    "special_role:N",
+                    title="Контрольные точки",
+                ),
+                color=alt.Color(
+                    "special_role:N",
+                    title="Контрольные точки",
+                ),
+                tooltip=tooltip,
+            )
+        )
+        special_labels = (
+            alt.Chart(special_df)
+            .mark_text(
+                dy=-16,
+                fontSize=11,
+                fontWeight="bold",
             )
             .encode(
                 x="cost:Q",
                 y="risk_mean:Q",
-                tooltip=tooltip,
+                text="special_role:N",
             )
         )
 
@@ -436,54 +685,130 @@ def render_decision_corridor(
             + mean_line
             + points
             + threshold_rule
-            + best_marker
+            + special_markers
+            + special_labels
         ).properties(
-            height=470,
+            height=500,
             title={
                 "text": "Коридор возможных решений",
                 "subtitle": [
                     "Вертикальный диапазон: P05–P95",
                     "Линия: ожидаемый риск",
-                    "Синий ромб: рекомендуемый вариант",
+                    "Контрольные точки: Baseline, Minimum Risk, "
+                    "Balanced Optimum, Minimum Cost",
                 ],
             },
         ).interactive()
 
         st.altair_chart(chart, use_container_width=True)
 
-    if not best_solution.empty:
-        best = best_solution.iloc[0]
+    st.markdown("#### Контрольные варианты")
+    card_columns = st.columns(4)
+    with card_columns[0]:
+        render_solution_card(
+            "Baseline",
+            baseline_row,
+            note="Точка отсчёта: сценарий без дополнительных действий.",
+        )
+    with card_columns[1]:
+        render_solution_card(
+            "Minimum Risk",
+            min_risk_row,
+            note="Минимальный P95 среди всех рассчитанных решений.",
+        )
+    with card_columns[2]:
+        render_solution_card(
+            "Balanced Optimum",
+            balanced_row,
+            note=(
+                f"Баланс: риск {risk_weight}%, стоимость "
+                f"{cost_weight}%, устойчивость {stability_weight}%."
+            ),
+        )
+    with card_columns[3]:
+        render_solution_card(
+            "Minimum Cost",
+            min_cost_row,
+            note="Самое дешёвое решение внутри допустимой зоны.",
+        )
+
+    if balanced_row is not None:
         status = (
             "находится в допустимой зоне"
-            if best["zone"] == "Допустимое решение"
-            else "лучший из рассчитанных, но требует пересмотра ограничений"
+            if balanced_row["zone"] == "Допустимое решение"
+            else "выбран из всех решений, поскольку допустимая зона пуста"
         )
         st.success(
-            f"**{best['variant']}** {status}. "
-            f"P95: {best['risk_p95']:.4f}; "
-            f"стоимость: {best['cost']:.3f}; "
-            f"устойчивость: {best['stability']:.1f}/100. "
-            f"Действия: {best['actions']}."
+            f"**Balanced Optimum: {balanced_row['variant']}** {status}. "
+            f"P95: {balanced_row['risk_p95']:.4f}; "
+            f"снижение к baseline: "
+            f"{balanced_row['risk_reduction_pct']:.1f}%; "
+            f"стоимость: {balanced_row['cost']:.3f}; "
+            f"устойчивость: {balanced_row['stability']:.1f}/100; "
+            f"Balanced Score: {balanced_row['balanced_score']:.1f}. "
+            f"Действия: {balanced_row['actions']}."
+        )
+
+    if efficiency_row is not None:
+        st.info(
+            f"**Лидер эффективности: {efficiency_row['variant']}** — "
+            f"{efficiency_row['efficiency']:.4f} единицы снижения P95 "
+            f"на единицу стоимости; снижение риска "
+            f"{efficiency_row['risk_reduction_pct']:.1f}%."
         )
 
     st.markdown("#### Таблица коридора")
     table_columns = [
         "variant",
+        "special_role",
         "zone",
         "cost",
         "risk_p05",
         "risk_mean",
         "risk_p95",
+        "risk_reduction_pct",
+        "efficiency",
         "stability",
+        "balanced_score",
         "actions",
     ]
+    table_df = working_df[table_columns].copy()
+    table_df = table_df.rename(
+        columns={
+            "variant": "Вариант",
+            "special_role": "Контрольная точка",
+            "zone": "Зона",
+            "cost": "Стоимость",
+            "risk_p05": "P05",
+            "risk_mean": "Средний риск",
+            "risk_p95": "P95",
+            "risk_reduction_pct": "Снижение P95, %",
+            "efficiency": "Эффективность",
+            "stability": "Устойчивость",
+            "balanced_score": "Balanced Score",
+            "actions": "Действия",
+        }
+    )
     st.dataframe(
-        working_df[table_columns].sort_values(
-            ["zone", "risk_p95", "cost"],
+        table_df.sort_values(
+            ["Зона", "P95", "Стоимость"],
             ascending=[True, True, True],
         ),
         use_container_width=True,
         hide_index=True,
+    )
+
+    st.download_button(
+        "Скачать таблицу коридора CSV",
+        data=table_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="tamver_decision_corridor.csv",
+        mime="text/csv",
+    )
+
+    st.caption(
+        "Эффективность = (Baseline P95 − P95 решения) / стоимость. "
+        "Balanced Score рассчитывается по нормированным риску, стоимости "
+        "и устойчивости внутри допустимой зоны."
     )
 
 
@@ -504,26 +829,40 @@ with st.sidebar:
     seed = st.number_input("Seed", value=42, step=1)
     budget_enabled = st.checkbox("Ограничить бюджет")
     budget = (
-        st.number_input("Максимальный бюджет", min_value=0.0, value=0.50, step=0.05)
+        st.number_input(
+            "Максимальный бюджет",
+            min_value=0.0,
+            value=0.50,
+            step=0.05,
+        )
         if budget_enabled
         else None
     )
 
     st.divider()
     st.header("Исходный шок")
-    shocks = {}
+    shocks: dict[str, float] = {}
     system_nodes = [
-        node for node in st.session_state.graph["nodes"]
+        node
+        for node in st.session_state.graph["nodes"]
         if node["kind"] == "system"
     ]
     selected_shock = st.selectbox(
         "Узел шока",
         [node["id"] for node in system_nodes],
         format_func=lambda node_id: next(
-            n["label"] for n in system_nodes if n["id"] == node_id
+            node["label"]
+            for node in system_nodes
+            if node["id"] == node_id
         ),
     )
-    shock_value = st.slider("Величина шока", -0.50, 0.50, 0.20, 0.01)
+    shock_value = st.slider(
+        "Величина шока",
+        -0.50,
+        0.50,
+        0.20,
+        0.01,
+    )
     shocks[selected_shock] = shock_value
 
 settings = {
@@ -547,22 +886,31 @@ tab_graph, tab_lab, tab_corridor, tab_agent, tab_data = st.tabs(
 with tab_graph:
     impact_map = None
     if st.session_state.last_result:
-        det = st.session_state.last_result.get("deterministic", {})
+        deterministic = st.session_state.last_result.get(
+            "deterministic",
+            {},
+        )
         impact_map = dict(
-            zip(det.get("nodes", []), det.get("total_impact", []))
+            zip(
+                deterministic.get("nodes", []),
+                deterministic.get("total_impact", []),
+            )
         )
     render_graph(st.session_state.graph, impact_map)
 
 with tab_lab:
     st.subheader("Ручной сценарий")
     decision_nodes = [
-        node for node in st.session_state.graph["nodes"]
+        node
+        for node in st.session_state.graph["nodes"]
         if node["kind"] == "decision"
     ]
-    decisions = {}
-    decision_columns = st.columns(min(3, max(1, len(decision_nodes))))
-    for idx, node in enumerate(decision_nodes):
-        with decision_columns[idx % len(decision_columns)]:
+    decisions: dict[str, float] = {}
+    decision_columns = st.columns(
+        min(3, max(1, len(decision_nodes)))
+    )
+    for index, node in enumerate(decision_nodes):
+        with decision_columns[index % len(decision_columns)]:
             decisions[node["id"]] = st.slider(
                 node["label"],
                 float(node["decision_min"]),
@@ -580,38 +928,63 @@ with tab_lab:
             "settings": settings,
         }
         try:
-            st.session_state.last_result = api_post("/simulate", payload)
+            st.session_state.last_result = api_post(
+                "/simulate",
+                payload,
+            )
         except Exception as exc:
             st.error(f"Ошибка API: {exc}")
 
     if st.session_state.last_result:
         result = st.session_state.last_result
-        det = result["deterministic"]
-        mc = result["monte_carlo"]
+        deterministic = result["deterministic"]
+        monte_carlo = result["monte_carlo"]
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Risk score", f"{det['risk_score']:.4f}")
-        c2.metric("Stability", f"{det['stability_score']:.1f}/100")
-        c3.metric("Stress risk P95", f"{mc['risk_p95']:.4f}")
-        c4.metric("Effective radius", f"{det['effective_radius']:.3f}")
+        c1.metric(
+            "Risk score",
+            f"{deterministic['risk_score']:.4f}",
+        )
+        c2.metric(
+            "Stability",
+            f"{deterministic['stability_score']:.1f}/100",
+        )
+        c3.metric(
+            "Stress risk P95",
+            f"{monte_carlo['risk_p95']:.4f}",
+        )
+        c4.metric(
+            "Effective radius",
+            f"{deterministic['effective_radius']:.3f}",
+        )
 
         impacts = pd.DataFrame(
             {
-                "node": det["nodes"],
-                "impact": det["total_impact"],
-                "p05": mc["impact_p05"],
-                "p95": mc["impact_p95"],
+                "node": deterministic["nodes"],
+                "impact": deterministic["total_impact"],
+                "p05": monte_carlo["impact_p05"],
+                "p95": monte_carlo["impact_p95"],
             }
-        ).sort_values("impact", key=lambda s: s.abs(), ascending=False)
+        ).sort_values(
+            "impact",
+            key=lambda series: series.abs(),
+            ascending=False,
+        )
         st.dataframe(impacts, use_container_width=True)
 
         centrality_df = (
-            pd.DataFrame.from_dict(result["centrality"], orient="index")
+            pd.DataFrame.from_dict(
+                result["centrality"],
+                orient="index",
+            )
             .reset_index(names="node")
             .sort_values("pagerank", ascending=False)
         )
         st.subheader("Network centrality")
-        st.dataframe(centrality_df, use_container_width=True)
+        st.dataframe(
+            centrality_df,
+            use_container_width=True,
+        )
 
 with tab_corridor:
     st.subheader("Поиск пространства допустимых решений")
@@ -649,7 +1022,9 @@ with tab_corridor:
             "budget": budget,
         }
         try:
-            with st.spinner("Поиск и стресс-тестирование вариантов..."):
+            with st.spinner(
+                "Поиск и стресс-тестирование вариантов..."
+            ):
                 st.session_state.last_recommendation = api_post(
                     "/agent/recommend",
                     payload,
@@ -681,7 +1056,9 @@ with tab_agent:
 
     prompt = st.chat_input("Опиши цель или вопрос к системе")
     if prompt:
-        st.session_state.history.append({"role": "user", "content": prompt})
+        st.session_state.history.append(
+            {"role": "user", "content": prompt}
+        )
         with st.chat_message("user"):
             st.markdown(prompt)
 
@@ -700,48 +1077,71 @@ with tab_agent:
 
                 if response["intent"] == "recommendation":
                     st.session_state.last_recommendation = response["data"]
-                    recs = response["data"]["recommendations"]
-                    if recs:
-                        best = recs[0]
+                    recommendations = response["data"]["recommendations"]
+                    if recommendations:
+                        best = recommendations[0]
                         actions = best["explanation"]["actions"]
                         if actions:
                             st.markdown("**Предлагаемые действия:**")
-                            st.dataframe(pd.DataFrame(actions), use_container_width=True)
+                            st.dataframe(
+                                pd.DataFrame(actions),
+                                use_container_width=True,
+                            )
 
                         paths = best["explanation"]["causal_paths"]
                         if paths:
-                            st.markdown("**Ключевые цепочки влияния:**")
-                            st.dataframe(pd.DataFrame(paths), use_container_width=True)
+                            st.markdown(
+                                "**Ключевые цепочки влияния:**"
+                            )
+                            st.dataframe(
+                                pd.DataFrame(paths),
+                                use_container_width=True,
+                            )
 
                         comparison = []
-                        for rec in recs:
-                            evaluation = rec["evaluation"]
+                        for recommendation in recommendations:
+                            evaluation = recommendation["evaluation"]
                             comparison.append(
                                 {
-                                    "rank": rec["rank"],
-                                    "risk_p05": evaluation.get("risk_p05"),
+                                    "rank": recommendation["rank"],
+                                    "risk_p05": evaluation.get(
+                                        "risk_p05"
+                                    ),
                                     "risk_mean": evaluation.get(
                                         "risk_mean",
                                         evaluation["risk"],
                                     ),
-                                    "stress_risk_p95": evaluation["robust_risk_p95"],
+                                    "stress_risk_p95": evaluation[
+                                        "robust_risk_p95"
+                                    ],
                                     "stability": evaluation["stability"],
                                     "cost": evaluation["cost"],
                                 }
                             )
-                        st.markdown("**Сравнение лучших вариантов:**")
-                        st.dataframe(pd.DataFrame(comparison), use_container_width=True)
+                        st.markdown(
+                            "**Сравнение лучших вариантов:**"
+                        )
+                        st.dataframe(
+                            pd.DataFrame(comparison),
+                            use_container_width=True,
+                        )
                         st.info(
                             "Полный Pareto-коридор доступен "
                             "во вкладке «Коридор решений»."
                         )
                 elif response["intent"] == "centrality":
-                    st.dataframe(pd.DataFrame(response["data"]), use_container_width=True)
+                    st.dataframe(
+                        pd.DataFrame(response["data"]),
+                        use_container_width=True,
+                    )
                 elif response["intent"] == "stress_test":
                     st.json(response["data"])
 
                 st.session_state.history.append(
-                    {"role": "assistant", "content": response["message"]}
+                    {
+                        "role": "assistant",
+                        "content": response["message"],
+                    }
                 )
             except Exception as exc:
                 message = f"Ошибка API: {exc}"
@@ -754,7 +1154,11 @@ with tab_data:
     st.subheader("Редактор JSON-модели")
     edited = st.text_area(
         "Graph JSON",
-        value=json.dumps(st.session_state.graph, ensure_ascii=False, indent=2),
+        value=json.dumps(
+            st.session_state.graph,
+            ensure_ascii=False,
+            indent=2,
+        ),
         height=600,
     )
     col_a, col_b = st.columns(2)
@@ -767,7 +1171,10 @@ with tab_data:
             except json.JSONDecodeError as exc:
                 st.error(f"Некорректный JSON: {exc}")
     with col_b:
-        uploaded = st.file_uploader("Загрузить graph.json", type=["json"])
+        uploaded = st.file_uploader(
+            "Загрузить graph.json",
+            type=["json"],
+        )
         if uploaded:
             st.session_state.graph = json.load(uploaded)
             st.session_state.last_recommendation = None
