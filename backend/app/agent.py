@@ -80,14 +80,18 @@ def score_candidate(
     if budget is not None and cost > budget:
         return {
             "score": float("inf"),
-            "risk": base.risk_score,
-            "stability": base.stability_score,
+            "risk": float(base.risk_score),
+            "risk_p05": float(base.risk_score),
+            "risk_mean": float(base.risk_score),
+            "robust_risk_p95": float(base.risk_score),
+            "stability": float(base.stability_score),
             "cost": cost,
             "budget_violation": True,
             "impact": base.total_impact.tolist(),
+            "warnings": base.warnings,
         }
 
-    # Small MC sample for candidate screening.
+    # Small Monte Carlo sample for candidate screening.
     screening_settings = settings.model_copy(
         update={"monte_carlo_runs": min(80, settings.monte_carlo_runs)}
     )
@@ -104,6 +108,8 @@ def score_candidate(
     return {
         "score": float(score),
         "risk": float(base.risk_score),
+        "risk_p05": float(mc["risk_p05"]),
+        "risk_mean": float(mc["risk_mean"]),
         "robust_risk_p95": robust_risk,
         "stability": float(base.stability_score),
         "cost": float(cost),
@@ -111,6 +117,79 @@ def score_candidate(
         "impact": base.total_impact.tolist(),
         "warnings": base.warnings,
     }
+
+
+def dominates(
+    candidate_a: Dict[str, object],
+    candidate_b: Dict[str, object],
+) -> bool:
+    """Return True when A is no worse than B and better in at least one metric."""
+
+    evaluation_a = candidate_a["evaluation"]
+    evaluation_b = candidate_b["evaluation"]
+
+    no_worse = (
+        evaluation_a["risk_mean"] <= evaluation_b["risk_mean"]
+        and evaluation_a["robust_risk_p95"] <= evaluation_b["robust_risk_p95"]
+        and evaluation_a["cost"] <= evaluation_b["cost"]
+        and evaluation_a["stability"] >= evaluation_b["stability"]
+    )
+    strictly_better = (
+        evaluation_a["risk_mean"] < evaluation_b["risk_mean"]
+        or evaluation_a["robust_risk_p95"] < evaluation_b["robust_risk_p95"]
+        or evaluation_a["cost"] < evaluation_b["cost"]
+        or evaluation_a["stability"] > evaluation_b["stability"]
+    )
+    return bool(no_worse and strictly_better)
+
+
+def pareto_corridor(
+    candidates: List[Dict[str, object]],
+    max_points: int = 40,
+) -> List[Dict[str, object]]:
+    """Build a compact non-dominated set for the decision corridor."""
+
+    valid = [
+        item for item in candidates
+        if not item["evaluation"].get("budget_violation", False)
+        and np.isfinite(item["evaluation"]["score"])
+    ]
+
+    front: List[Dict[str, object]] = []
+    for index, candidate in enumerate(valid):
+        if any(
+            dominates(other, candidate)
+            for other_index, other in enumerate(valid)
+            if other_index != index
+        ):
+            continue
+        front.append(candidate)
+
+    # The visual corridor needs more than one point. Use the strongest
+    # candidates as a fallback when the strict Pareto front is too small.
+    if len(front) < 3:
+        front = sorted(
+            valid,
+            key=lambda item: (
+                item["evaluation"]["score"],
+                item["evaluation"]["cost"],
+            ),
+        )[: min(max_points, len(valid))]
+
+    front.sort(
+        key=lambda item: (
+            item["evaluation"]["cost"],
+            item["evaluation"]["robust_risk_p95"],
+            item["evaluation"]["risk_mean"],
+        )
+    )
+
+    if len(front) <= max_points:
+        return front
+
+    # Preserve the full cost range while limiting the response payload.
+    indices = np.linspace(0, len(front) - 1, max_points, dtype=int)
+    return [front[int(index)] for index in indices]
 
 
 def explain_recommendation(
@@ -206,11 +285,22 @@ def recommend(request: RecommendationRequest) -> Dict[str, object]:
             }
         )
 
+    corridor_items = pareto_corridor(pool)
+    corridor = [
+        {
+            "rank": rank,
+            "decisions": item["decisions"],
+            "evaluation": item["evaluation"],
+        }
+        for rank, item in enumerate(corridor_items, start=1)
+    ]
+
     return {
         "command": request.command,
         "objective": objective.__dict__,
         "baseline": baseline,
         "recommendations": enriched,
+        "decision_corridor": corridor,
         "centrality": centrality(request.graph),
     }
 
